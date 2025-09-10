@@ -1,54 +1,107 @@
-name: Daily Image Emailer
+name: Imagem do Dia
 
 on:
   schedule:
-    - cron: "0 11 * * *" # 08:00 America/Sao_Paulo
-  workflow_dispatch: {}
+    - cron: "0 11 * * *"   # 08:00 America/Sao_Paulo
+  workflow_dispatch: {}     # permite rodar na hora
 
 jobs:
   run-daily:
     runs-on: ubuntu-latest
     steps:
-      - name: Run generator
+      - name: Instalar dependências
         run: |
-          python -m pip install requests
+          python -m pip install --upgrade pip requests
+
+      - name: Gerar e enviar imagem (com tratamento de erro)
+        run: |
           cat > script.py <<'EOF'
-          import os, requests, smtplib, mimetypes
+          import os, time, json, requests, smtplib, mimetypes, sys
           from email.message import EmailMessage
           from datetime import datetime, timezone, timedelta
-          
-          HF_TOKEN = os.getenv("HF_TOKEN")
-          PROMPT = os.getenv("PROMPT", "Um nascer do sol nas montanhas do Brasil, estilo realista")
-          SMTP_USER = os.getenv("SMTP_USER")
-          SMTP_PASS = os.getenv("SMTP_PASS")
-          SMTP_TO   = os.getenv("SMTP_TO")
-          
-          # gerar imagem
-          url = "https://api-inference.huggingface.co/models/stabilityai/sd-turbo"
-          headers = {"Authorization": f"Bearer {HF_TOKEN}"}
-          payload = {"inputs": PROMPT, "options": {"wait_for_model": True}}
-          r = requests.post(url, headers=headers, json=payload, timeout=120)
-          img = "daily.png"
-          with open(img, "wb") as f: f.write(r.content)
 
-          # enviar email
+          # ---- Config ----
+          HF_TOKEN   = os.getenv("HF_TOKEN")
+          HF_MODEL   = os.getenv("HF_MODEL", "stabilityai/sd-turbo")
+          PROMPT     = os.getenv("PROMPT", "Um nascer do sol nas montanhas do Brasil, estilo realista")
+          SMTP_USER  = os.getenv("SMTP_USER")
+          SMTP_PASS  = os.getenv("SMTP_PASS")
+          SMTP_TO    = os.getenv("SMTP_TO")
+          SMTP_HOST  = os.getenv("SMTP_HOST", "smtp.gmail.com")
+          SMTP_PORT  = int(os.getenv("SMTP_PORT", "587"))
+          OUT_NAME   = "daily.png"
+
+          if not (HF_TOKEN and SMTP_USER and SMTP_PASS and SMTP_TO):
+            print("Faltando variáveis obrigatórias (HF_TOKEN/SMTP_USER/SMTP_PASS/SMTP_TO).", file=sys.stderr)
+            sys.exit(1)
+
+          url = f"https://api-inference.huggingface.co/models/{HF_MODEL}"
+          headers = {"Authorization": f"Bearer {HF_TOKEN}"}
+          payload = {
+            "inputs": PROMPT,
+            "options": {"wait_for_model": True}
+          }
+
+          def try_generate(max_retries=3, delay=15):
+            for i in range(1, max_retries+1):
+              print(f"[HF] Tentativa {i}/{max_retries} no modelo {HF_MODEL}…")
+              r = requests.post(url, headers=headers, json=payload, timeout=180)
+              ctype = r.headers.get("content-type", "")
+              if r.status_code != 200:
+                print(f"[HF] HTTP {r.status_code}: {r.text[:400]}")
+              # Se vier JSON, normalmente é erro do backend
+              if "application/json" in ctype:
+                try:
+                  data = r.json()
+                except Exception:
+                  data = {"raw": r.text[:400]}
+                print("[HF] Resposta JSON:", data)
+                # Erros comuns: modelo dormindo, fila, permissões
+                if i < max_retries:
+                  print(f"[HF] Aguardando {delay}s e tentando de novo…")
+                  time.sleep(delay)
+                  continue
+                else:
+                  raise SystemExit("Falha ao gerar imagem (JSON/erro).")
+              # Chegou binário (imagem)
+              with open(OUT_NAME, "wb") as f:
+                f.write(r.content)
+              print(f"[OK] Imagem salva em {OUT_NAME} ({len(r.content)} bytes).")
+              return OUT_NAME
+            raise SystemExit("Falha ao gerar imagem após múltiplas tentativas.")
+
+          # Geração
+          img_path = try_generate()
+
+          # Envio por e-mail
           msg = EmailMessage()
           msg["Subject"] = "Imagem do dia"
           msg["From"] = SMTP_USER
           msg["To"] = SMTP_TO
           tz = timezone(timedelta(hours=-3))
-          msg.set_content(f"Gerado em {datetime.now(tz)}\nPrompt: {PROMPT}")
-          with open(img, "rb") as f:
-              maintype, subtype = "image", "png"
-              msg.add_attachment(f.read(), maintype=maintype, subtype=subtype, filename=img)
-          with smtplib.SMTP("smtp.gmail.com", 587) as s:
-              s.starttls(); s.login(SMTP_USER, SMTP_PASS); s.send_message(msg)
+          msg.set_content(f"Gerado em {datetime.now(tz):%d/%m/%Y %H:%M}\nModelo: {HF_MODEL}\nPrompt: {PROMPT}")
+
+          ctype, _ = mimetypes.guess_type(img_path)
+          if not ctype:
+            ctype = "image/png"
+          maintype, subtype = ctype.split("/", 1)
+          with open(img_path, "rb") as f:
+            msg.add_attachment(f.read(), maintype=maintype, subtype=subtype, filename=img_path)
+
+          with smtplib.SMTP(SMTP_HOST, SMTP_PORT) as s:
+            s.starttls()
+            s.login(SMTP_USER, SMTP_PASS)
+            s.send_message(msg)
           print("E-mail enviado com sucesso!")
           EOF
+
           python script.py
         env:
-          HF_TOKEN: ${{ secrets.HF_TOKEN }}
-          PROMPT: ${{ vars.PROMPT }}
-          SMTP_USER: ${{ secrets.SMTP_USER }}
-          SMTP_PASS: ${{ secrets.SMTP_PASS }}
-          SMTP_TO: ${{ vars.SMTP_TO }}
+          HF_TOKEN:   ${{ secrets.HF_TOKEN }}
+          SMTP_USER:  ${{ secrets.SMTP_USER }}
+          SMTP_PASS:  ${{ secrets.SMTP_PASS }}
+          SMTP_TO:    ${{ vars.SMTP_TO }}
+          PROMPT:     ${{ vars.PROMPT }}
+          HF_MODEL:   ${{ vars.HF_MODEL }}   # ex: stabilityai/sd-turbo
+          SMTP_HOST:  ${{ vars.SMTP_HOST }}  # opcional se não for Gmail
+          SMTP_PORT:  ${{ vars.SMTP_PORT }}  # opcional se não for Gmail
