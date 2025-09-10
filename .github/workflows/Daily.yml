@@ -1,0 +1,54 @@
+name: Daily Image Emailer
+
+on:
+  schedule:
+    - cron: "0 11 * * *" # 08:00 America/Sao_Paulo
+  workflow_dispatch: {}
+
+jobs:
+  run-daily:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Run generator
+        run: |
+          python -m pip install requests
+          cat > script.py <<'EOF'
+          import os, requests, smtplib, mimetypes
+          from email.message import EmailMessage
+          from datetime import datetime, timezone, timedelta
+          
+          HF_TOKEN = os.getenv("HF_TOKEN")
+          PROMPT = os.getenv("PROMPT", "Um nascer do sol nas montanhas do Brasil, estilo realista")
+          SMTP_USER = os.getenv("SMTP_USER")
+          SMTP_PASS = os.getenv("SMTP_PASS")
+          SMTP_TO   = os.getenv("SMTP_TO")
+          
+          # gerar imagem
+          url = "https://api-inference.huggingface.co/models/stabilityai/sd-turbo"
+          headers = {"Authorization": f"Bearer {HF_TOKEN}"}
+          payload = {"inputs": PROMPT, "options": {"wait_for_model": True}}
+          r = requests.post(url, headers=headers, json=payload, timeout=120)
+          img = "daily.png"
+          with open(img, "wb") as f: f.write(r.content)
+
+          # enviar email
+          msg = EmailMessage()
+          msg["Subject"] = "Imagem do dia"
+          msg["From"] = SMTP_USER
+          msg["To"] = SMTP_TO
+          tz = timezone(timedelta(hours=-3))
+          msg.set_content(f"Gerado em {datetime.now(tz)}\nPrompt: {PROMPT}")
+          with open(img, "rb") as f:
+              maintype, subtype = "image", "png"
+              msg.add_attachment(f.read(), maintype=maintype, subtype=subtype, filename=img)
+          with smtplib.SMTP("smtp.gmail.com", 587) as s:
+              s.starttls(); s.login(SMTP_USER, SMTP_PASS); s.send_message(msg)
+          print("E-mail enviado com sucesso!")
+          EOF
+          python script.py
+        env:
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+          PROMPT: ${{ vars.PROMPT }}
+          SMTP_USER: ${{ secrets.SMTP_USER }}
+          SMTP_PASS: ${{ secrets.SMTP_PASS }}
+          SMTP_TO: ${{ vars.SMTP_TO }}
