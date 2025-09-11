@@ -111,6 +111,6 @@ jobs:
           SMTP_TO:    ${{ vars.SMTP_TO }}
           PROMPT:     ${{ vars.PROMPT }}
           IMG_SIZE:   ${{ vars.IMG_SIZE }}     # ex: 1024x1024
-          IMG_QUALITY:${{ vars.IMG_QUALITY }}  # low|medium|high
+          IMG_QUALITY: ${{ vars.IMG_QUALITY }} # low|medium|high
           SMTP_HOST:  ${{ vars.SMTP_HOST }}
           SMTP_PORT:  ${{ vars.SMTP_PORT }}
