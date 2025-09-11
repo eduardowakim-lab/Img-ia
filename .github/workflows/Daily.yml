@@ -22,34 +22,36 @@ jobs:
 
           # ---- Config ----
           OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
-          PROMPT     = os.getenv("PROMPT", "Um nascer do sol nas montanhas do Brasil, estilo realista")
-          SIZE       = os.getenv("IMG_SIZE", "1024x1024")
-          QUALITY    = os.getenv("IMG_QUALITY", "medium")   # low | medium | high
-          N_IMAGES   = int(os.getenv("N_IMAGES", "1"))
-          OUT_NAME   = "daily.png"
+          PROMPT   = os.getenv("PROMPT", "Um nascer do sol nas montanhas do Brasil, estilo realista")
+          SIZE     = os.getenv("IMG_SIZE", "1024x1024")   # 512x512 | 1024x1024 | 2048x2048
+          N_IMAGES = int(os.getenv("N_IMAGES", "1"))
+          OUT_NAME = "daily.png"
 
-          SMTP_USER  = os.getenv("SMTP_USER")
-          SMTP_PASS  = os.getenv("SMTP_PASS")
-          SMTP_TO    = os.getenv("SMTP_TO")
-          SMTP_HOST  = os.getenv("SMTP_HOST", "smtp.gmail.com")
-          SMTP_PORT  = int(os.getenv("SMTP_PORT", "587"))
+          SMTP_USER = os.getenv("SMTP_USER")
+          SMTP_PASS = os.getenv("SMTP_PASS")
+          SMTP_TO   = os.getenv("SMTP_TO")
+          SMTP_HOST = os.getenv("SMTP_HOST", "smtp.gmail.com")
+          SMTP_PORT = int(os.getenv("SMTP_PORT", "587"))
 
-          if not (OPENAI_API_KEY and SMTP_USER and SMTP_PASS and SMTP_TO):
-            print("Faltam variáveis obrigatórias (OPENAI_API_KEY/SMTP_USER/SMTP_PASS/SMTP_TO).", file=sys.stderr)
+          # Verificação de envs obrigatórios (lista quais faltam)
+          required = ("OPENAI_API_KEY","SMTP_USER","SMTP_PASS","SMTP_TO")
+          missing = [k for k in required if not os.getenv(k)]
+          if missing:
+            print("Faltando variáveis: " + ", ".join(missing), file=sys.stderr)
             sys.exit(1)
 
+          # Endpoint para geração de imagens
           url = "https://api.openai.com/v1/images/generations"
           headers = {
             "Authorization": f"Bearer {OPENAI_API_KEY}",
             "Content-Type": "application/json",
           }
+          # Sem 'response_format' e sem 'quality' para evitar 400
           payload = {
             "model": "gpt-image-1",
             "prompt": PROMPT,
             "size": SIZE,
-            "quality": QUALITY,
-            "n": N_IMAGES,
-            "response_format": "b64_json"
+            "n": N_IMAGES
           }
 
           def try_generate(max_retries=3, delay=15):
@@ -57,25 +59,47 @@ jobs:
               print(f"[OpenAI] Tentativa {i}/{max_retries}…")
               r = requests.post(url, headers=headers, json=payload, timeout=180)
               if r.status_code != 200:
-                print(f"[OpenAI] HTTP {r.status_code}: {r.text[:400]}")
+                print(f"[OpenAI] HTTP {r.status_code}: {r.text[:500]}")
                 if i < max_retries:
+                  print(f"[OpenAI] Aguardando {delay}s e tentando de novo…")
                   time.sleep(delay)
                   continue
-                raise SystemExit("Falha ao gerar imagem.")
+                else:
+                  raise SystemExit("Falha ao gerar imagem.")
+
               data = r.json()
               if not data.get("data"):
-                print("[OpenAI] Resposta inesperada:", json.dumps(data)[:400])
+                print("[OpenAI] Resposta inesperada:", json.dumps(data)[:500])
                 if i < max_retries:
                   time.sleep(delay)
                   continue
                 raise SystemExit("Sem dados de imagem na resposta.")
-              b64 = data["data"][0]["b64_json"]
-              with open(OUT_NAME, "wb") as f:
-                f.write(base64.b64decode(b64))
-              print(f"[OK] Imagem salva em {OUT_NAME}.")
-              return OUT_NAME
+
+              # Aceita b64_json OU url
+              item = data["data"][0]
+              if "b64_json" in item:
+                b64 = item["b64_json"]
+                with open(OUT_NAME, "wb") as f:
+                  f.write(base64.b64decode(b64))
+                print(f"[OK] Imagem salva em {OUT_NAME} (via b64).")
+                return OUT_NAME
+              elif "url" in item:
+                img_url = item["url"]
+                img = requests.get(img_url, timeout=180)
+                img.raise_for_status()
+                with open(OUT_NAME, "wb") as f:
+                  f.write(img.content)
+                print(f"[OK] Imagem salva em {OUT_NAME} (via url).")
+                return OUT_NAME
+              else:
+                print("[OpenAI] Item sem b64_json nem url:", item)
+                if i < max_retries:
+                  time.sleep(delay)
+                  continue
+                raise SystemExit("Formato de resposta não suportado.")
             raise SystemExit("Falha após múltiplas tentativas.")
 
+          # Geração
           img_path = try_generate()
 
           # Envio por e-mail
@@ -83,11 +107,11 @@ jobs:
           msg["Subject"] = "Imagem do dia"
           msg["From"] = SMTP_USER
           msg["To"] = SMTP_TO
-          tz = timezone(timedelta(hours=-3))
+          tz = timezone(timedelta(hours=-3))  # America/Sao_Paulo
           msg.set_content(
-              f"Gerado em {datetime.now(tz):%d/%m/%Y %H:%M}\n"
-              f"Modelo: gpt-image-1\nPrompt: {PROMPT}\n"
-              f"Tamanho: {SIZE} | Qualidade: {QUALITY}"
+            f"Gerado em {datetime.now(tz):%d/%m/%Y %H:%M}\n"
+            f"Modelo: gpt-image-1\nPrompt: {PROMPT}\n"
+            f"Tamanho: {SIZE}"
           )
 
           ctype, _ = mimetypes.guess_type(img_path)
@@ -112,6 +136,6 @@ jobs:
           SMTP_TO:    ${{ vars.SMTP_TO }}
           PROMPT:     ${{ vars.PROMPT }}
           IMG_SIZE:   ${{ vars.IMG_SIZE }}     # ex: 1024x1024
-          IMG_QUALITY: ${{ vars.IMG_QUALITY }} # low|medium|high
-          SMTP_HOST:  ${{ vars.SMTP_HOST }}
-          SMTP_PORT:  ${{ vars.SMTP_PORT }}
+          N_IMAGES:   ${{ vars.N_IMAGES }}     # ex: 1
+          SMTP_HOST:  ${{ vars.SMTP_HOST }}    # opcional
+          SMTP_PORT:  ${{ vars.SMTP_PORT }}    # opcional
