@@ -3,7 +3,7 @@ name: Imagem do Dia
 on:
   schedule:
     - cron: "0 11 * * *"   # 08:00 America/Sao_Paulo
-  workflow_dispatch: {}     # permite rodar na hora
+  workflow_dispatch: {}
 
 jobs:
   run-daily:
@@ -16,59 +16,67 @@ jobs:
       - name: Gerar e enviar imagem (com tratamento de erro)
         run: |
           cat > script.py <<'EOF'
-          import os, time, json, requests, smtplib, mimetypes, sys
+          import os, time, json, base64, requests, smtplib, mimetypes, sys
           from email.message import EmailMessage
           from datetime import datetime, timezone, timedelta
 
           # ---- Config ----
-          HF_TOKEN   = os.getenv("HF_TOKEN")
-          HF_MODEL   = os.getenv("HF_MODEL", "stabilityai/sd-turbo")
+          OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
           PROMPT     = os.getenv("PROMPT", "Um nascer do sol nas montanhas do Brasil, estilo realista")
+          SIZE       = os.getenv("IMG_SIZE", "1024x1024")   # 512x512 | 1024x1024 | 2048x2048
+          QUALITY    = os.getenv("IMG_QUALITY", "medium")   # low | medium | high
+          N_IMAGES   = int(os.getenv("N_IMAGES", "1"))
+          OUT_NAME   = "daily.png"
+
           SMTP_USER  = os.getenv("SMTP_USER")
           SMTP_PASS  = os.getenv("SMTP_PASS")
           SMTP_TO    = os.getenv("SMTP_TO")
           SMTP_HOST  = os.getenv("SMTP_HOST", "smtp.gmail.com")
           SMTP_PORT  = int(os.getenv("SMTP_PORT", "587"))
-          OUT_NAME   = "daily.png"
 
-          if not (HF_TOKEN and SMTP_USER and SMTP_PASS and SMTP_TO):
-            print("Faltando variáveis obrigatórias (HF_TOKEN/SMTP_USER/SMTP_PASS/SMTP_TO).", file=sys.stderr)
+          if not (OPENAI_API_KEY and SMTP_USER and SMTP_PASS and SMTP_TO):
+            print("Faltam variáveis obrigatórias (OPENAI_API_KEY/SMTP_USER/SMTP_PASS/SMTP_TO).", file=sys.stderr)
             sys.exit(1)
 
-          url = f"https://api-inference.huggingface.co/models/{HF_MODEL}"
-          headers = {"Authorization": f"Bearer {HF_TOKEN}"}
+          url = "https://api.openai.com/v1/images/generations"
+          headers = {
+            "Authorization": f"Bearer {OPENAI_API_KEY}",
+            "Content-Type": "application/json",
+          }
           payload = {
-            "inputs": PROMPT,
-            "options": {"wait_for_model": True}
+            "model": "gpt-image-1",
+            "prompt": PROMPT,
+            "size": SIZE,
+            "quality": QUALITY,
+            "n": N_IMAGES,
+            "response_format": "b64_json"
           }
 
           def try_generate(max_retries=3, delay=15):
             for i in range(1, max_retries+1):
-              print(f"[HF] Tentativa {i}/{max_retries} no modelo {HF_MODEL}…")
+              print(f"[OpenAI] Tentativa {i}/{max_retries}…")
               r = requests.post(url, headers=headers, json=payload, timeout=180)
-              ctype = r.headers.get("content-type", "")
               if r.status_code != 200:
-                print(f"[HF] HTTP {r.status_code}: {r.text[:400]}")
-              # Se vier JSON, normalmente é erro do backend
-              if "application/json" in ctype:
-                try:
-                  data = r.json()
-                except Exception:
-                  data = {"raw": r.text[:400]}
-                print("[HF] Resposta JSON:", data)
-                # Erros comuns: modelo dormindo, fila, permissões
+                print(f"[OpenAI] HTTP {r.status_code}: {r.text[:400]}")
                 if i < max_retries:
-                  print(f"[HF] Aguardando {delay}s e tentando de novo…")
+                  print(f"[OpenAI] Aguardando {delay}s e tentando de novo…")
                   time.sleep(delay)
                   continue
                 else:
-                  raise SystemExit("Falha ao gerar imagem (JSON/erro).")
-              # Chegou binário (imagem)
+                  raise SystemExit("Falha ao gerar imagem.")
+              data = r.json()
+              if not data.get("data"):
+                print("[OpenAI] Resposta inesperada:", json.dumps(data)[:400])
+                if i < max_retries:
+                  time.sleep(delay)
+                  continue
+                raise SystemExit("Sem dados de imagem na resposta.")
+              b64 = data["data"][0]["b64_json"]
               with open(OUT_NAME, "wb") as f:
-                f.write(r.content)
-              print(f"[OK] Imagem salva em {OUT_NAME} ({len(r.content)} bytes).")
+                f.write(base64.b64decode(b64))
+              print(f"[OK] Imagem salva em {OUT_NAME}.")
               return OUT_NAME
-            raise SystemExit("Falha ao gerar imagem após múltiplas tentativas.")
+            raise SystemExit("Falha após múltiplas tentativas.")
 
           # Geração
           img_path = try_generate()
@@ -79,7 +87,7 @@ jobs:
           msg["From"] = SMTP_USER
           msg["To"] = SMTP_TO
           tz = timezone(timedelta(hours=-3))
-          msg.set_content(f"Gerado em {datetime.now(tz):%d/%m/%Y %H:%M}\nModelo: {HF_MODEL}\nPrompt: {PROMPT}")
+          msg.set_content(f"Gerado em {datetime.now(tz):%d/%m/%Y %H:%M}\nModelo: gpt-image-1\nPrompt: {PROMPT}\nTamanho: {SIZE} | Qualidade: {QUALITY}")
 
           ctype, _ = mimetypes.guess_type(img_path)
           if not ctype:
@@ -97,11 +105,12 @@ jobs:
 
           python script.py
         env:
-          HF_TOKEN:   ${{ secrets.HF_TOKEN }}
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
           SMTP_USER:  ${{ secrets.SMTP_USER }}
           SMTP_PASS:  ${{ secrets.SMTP_PASS }}
           SMTP_TO:    ${{ vars.SMTP_TO }}
           PROMPT:     ${{ vars.PROMPT }}
-          HF_MODEL:   ${{ vars.HF_MODEL }}   # ex: stabilityai/sd-turbo
-          SMTP_HOST:  ${{ vars.SMTP_HOST }}  # opcional se não for Gmail
-          SMTP_PORT:  ${{ vars.SMTP_PORT }}  # opcional se não for Gmail
+          IMG_SIZE:   ${{ vars.IMG_SIZE }}     # ex: 1024x1024
+          IMG_QUALITY:${{ vars.IMG_QUALITY }}  # low|medium|high
+          SMTP_HOST:  ${{ vars.SMTP_HOST }}
+          SMTP_PORT:  ${{ vars.SMTP_PORT }}
