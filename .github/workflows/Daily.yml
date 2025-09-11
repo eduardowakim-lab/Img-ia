@@ -92,11 +92,9 @@ jobs:
               title = (e.get("title") or "").strip()
               summary = (e.get("summary") or e.get("description") or "").strip().replace("\n"," ")
               link = (e.get("link") or "").strip()
-              print(f"[news] Título: {title}")
-              print(f"[news] Link: {link}")
               return {"title": title, "summary": summary, "link": link}
 
-          # ---- Geração de imagem ----
+          # ---- Geração de imagem (independente da notícia) ----
           def generate_image():
               s = session_with_retries()
               url = "https://api.openai.com/v1/images/generations"
@@ -104,9 +102,7 @@ jobs:
               payload = {"model":"gpt-image-1","prompt":PROMPT,"size":SIZE,"n":N_IMAGES}
               print(f"[img] Gerando imagem com size={SIZE} n={N_IMAGES}")
               r = s.post(url, headers=headers, json=payload, timeout=HTTP_TIMEOUT)
-              if r.status_code != 200:
-                  print("[img] Erro:", r.text, file=sys.stderr)
-                  r.raise_for_status()
+              r.raise_for_status()
               data = r.json()
               item = data["data"][0]
               if "b64_json" in item:
@@ -119,7 +115,7 @@ jobs:
               print(f"[img] OK -> {OUT_NAME}")
               return OUT_NAME
 
-          # ---- Geração de legenda ----
+          # ---- Geração de legenda (com base na notícia) ----
           def generate_caption(news):
               s = session_with_retries()
               url = "https://api.openai.com/v1/chat/completions"
@@ -144,10 +140,7 @@ jobs:
                   return "Resumo do dia pronto para o feed. #noticias #hoje #brasil"
               data = r.json()
               content = data["choices"][0]["message"]["content"].strip().replace("\n"," ")
-              if not content:
-                  content = "Resumo do dia pronto para o feed. #noticias #hoje #brasil"
-              print(f"[caption] {content}")
-              return content
+              return content or "Resumo do dia pronto para o feed. #noticias #hoje #brasil"
 
           # ---- Execução ----
           news = fetch_top_news()
@@ -162,32 +155,26 @@ jobs:
           msg["From"] = SMTP_USER
           msg["To"] = SMTP_TO
 
-          # Corpo: legenda + link da notícia
+          # Corpo: legenda + link da notícia — (sem metadados chatos)
           body = (
               "Legenda sugerida para Instagram (copie e cole):\n\n"
               f"{caption}\n\n"
               f"Fonte: {news['link']}\n"
           )
-          print("[mail] Tamanho do corpo (chars):", len(body))
-          msg.set_content(body)  # define o corpo ANTES dos anexos
+          msg.set_content(body)
 
           # Anexar a imagem
           ctype,_ = mimetypes.guess_type(img_path)
           if not ctype: ctype="image/png"
           maintype,subtype = ctype.split("/",1)
           with open(img_path,"rb") as f:
-              img_bytes = f.read()
-              print("[mail] Anexando imagem, bytes:", len(img_bytes))
-              msg.add_attachment(img_bytes, maintype=maintype, subtype=subtype, filename=os.path.basename(img_path))
+              msg.add_attachment(f.read(), maintype=maintype, subtype=subtype, filename=os.path.basename(img_path))
 
           # Anexar caption.txt
-          cap_bytes = caption.encode("utf-8")
-          print("[mail] Anexando caption.txt, bytes:", len(cap_bytes))
-          msg.add_attachment(cap_bytes, maintype="text", subtype="plain", filename="caption.txt")
+          msg.add_attachment(caption.encode("utf-8"), maintype="text", subtype="plain", filename="caption.txt")
 
           # Anexar news.txt (título + link)
           news_txt = f"{news['title']}\n{news['link']}\n".encode("utf-8")
-          print("[mail] Anexando news.txt, bytes:", len(news_txt))
           msg.add_attachment(news_txt, maintype="text", subtype="plain", filename="news.txt")
 
           # Envio SMTP
@@ -198,13 +185,10 @@ jobs:
               if SMTP_PORT==587:
                   s.starttls(); s.ehlo()
               s.login(SMTP_USER, SMTP_PASS)
-              refused = s.send_message(msg)
+              s.send_message(msg)
               s.quit()
           except Exception:
               print("Erro SMTP:\n"+traceback.format_exc(), file=sys.stderr); sys.exit(1)
-
-          if refused:
-              print(f"Aviso: servidor recusou alguns destinatários: {refused}", file=sys.stderr); sys.exit(1)
 
           print("E-mail enviado com sucesso! (imagem + legenda + news.txt)")
           EOF
@@ -215,7 +199,7 @@ jobs:
           SMTP_USER:  ${{ secrets.SMTP_USER }}
           SMTP_PASS:  ${{ secrets.SMTP_PASS }}
           SMTP_TO:    ${{ vars.SMTP_TO }}
-          PROMPT:     ${{ vars.PROMPT }}
+          PROMPT:     ${{ vars.PROMPT }}       # define apenas a IMAGEM
           IMG_SIZE:   ${{ vars.IMG_SIZE }}     # ex: 1024x1024
           N_IMAGES:   ${{ vars.N_IMAGES }}
           SMTP_HOST:  ${{ vars.SMTP_HOST }}
