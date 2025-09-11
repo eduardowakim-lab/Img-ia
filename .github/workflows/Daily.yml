@@ -23,7 +23,7 @@ jobs:
           # ---- Config ----
           OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
           PROMPT     = os.getenv("PROMPT", "Um nascer do sol nas montanhas do Brasil, estilo realista")
-          SIZE       = os.getenv("IMG_SIZE", "1024x1024")   # 512x512 | 1024x1024 | 2048x2048
+          SIZE       = os.getenv("IMG_SIZE", "1024x1024")
           QUALITY    = os.getenv("IMG_QUALITY", "medium")   # low | medium | high
           N_IMAGES   = int(os.getenv("N_IMAGES", "1"))
           OUT_NAME   = "daily.png"
@@ -59,11 +59,9 @@ jobs:
               if r.status_code != 200:
                 print(f"[OpenAI] HTTP {r.status_code}: {r.text[:400]}")
                 if i < max_retries:
-                  print(f"[OpenAI] Aguardando {delay}s e tentando de novo…")
                   time.sleep(delay)
                   continue
-                else:
-                  raise SystemExit("Falha ao gerar imagem.")
+                raise SystemExit("Falha ao gerar imagem.")
               data = r.json()
               if not data.get("data"):
                 print("[OpenAI] Resposta inesperada:", json.dumps(data)[:400])
@@ -78,7 +76,6 @@ jobs:
               return OUT_NAME
             raise SystemExit("Falha após múltiplas tentativas.")
 
-          # Geração
           img_path = try_generate()
 
           # Envio por e-mail
@@ -87,7 +84,11 @@ jobs:
           msg["From"] = SMTP_USER
           msg["To"] = SMTP_TO
           tz = timezone(timedelta(hours=-3))
-          msg.set_content(f"Gerado em {datetime.now(tz):%d/%m/%Y %H:%M}\nModelo: gpt-image-1\nPrompt: {PROMPT}\nTamanho: {SIZE} | Qualidade: {QUALITY}")
+          msg.set_content(
+              f"Gerado em {datetime.now(tz):%d/%m/%Y %H:%M}\n"
+              f"Modelo: gpt-image-1\nPrompt: {PROMPT}\n"
+              f"Tamanho: {SIZE} | Qualidade: {QUALITY}"
+          )
 
           ctype, _ = mimetypes.guess_type(img_path)
           if not ctype:
