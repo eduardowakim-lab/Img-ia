@@ -8,17 +8,21 @@ on:
 jobs:
   run-daily:
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     steps:
       - name: Instalar dependências
         run: |
           python -m pip install --upgrade pip requests
 
-      - name: Gerar e enviar imagem (com tratamento de erro e SMTP debug)
+      - name: Gerar e enviar imagem (com retries e SMTP debug)
+        timeout-minutes: 15
         run: |
           cat > script.py <<'EOF'
           import os, time, json, base64, requests, smtplib, mimetypes, sys, traceback
           from email.message import EmailMessage
           from datetime import datetime, timezone, timedelta
+          from requests.adapters import HTTPAdapter
+          from urllib3.util.retry import Retry
 
           # ---- Config (com defaults seguros) ----
           OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
@@ -41,7 +45,7 @@ jobs:
           except ValueError:
               SMTP_PORT = 587
 
-          # Verificação de envs obrigatórios (lista quais faltam)
+          # Verificação de envs obrigatórios
           required = ("OPENAI_API_KEY","SMTP_USER","SMTP_PASS","SMTP_TO")
           missing = [k for k in required if not os.getenv(k)]
           if missing:
@@ -53,68 +57,137 @@ jobs:
               sys.exit(1)
 
           # Endpoint para geração de imagens
-          url = "https://api.openai.com/v1/images/generations"
-          headers = {
+          URL = "https://api.openai.com/v1/images/generations"
+          HEADERS = {
               "Authorization": f"Bearer {OPENAI_API_KEY}",
               "Content-Type": "application/json",
+              "Connection": "close",  # runners efêmeros gostam disso
           }
-          payload = {
+          PAYLOAD = {
               "model": "gpt-image-1",
               "prompt": PROMPT,
               "size": SIZE,
               "n": N_IMAGES
           }
 
+          # ---- HTTP session robusta (retries + backoff) ----
+          def session_with_retries():
+              retry = Retry(
+                  total=6,
+                  connect=3,
+                  read=3,
+                  backoff_factor=1.5,  # 0, 1.5, 3.0, 4.5, ...
+                  status_forcelist=(408, 409, 429, 500, 502, 503, 504),
+                  allowed_methods=frozenset(["GET","POST","PUT","DELETE","PATCH","OPTIONS"])
+              )
+              adapter = HTTPAdapter(max_retries=retry, pool_maxsize=20)
+              s = requests.Session()
+              s.mount("https://", adapter)
+              s.mount("http://", adapter)
+              s.headers.update({"Connection": "close"})
+              return s
+
+          HTTP_TIMEOUT = (15, 360)  # (connect, read)
+
           def try_generate(max_retries=3, delay=15):
+              s = session_with_retries()
+              last_err_txt = None
+
               for i in range(1, max_retries+1):
-                  print(f"[OpenAI] Tentativa {i}/{max_retries}…")
-                  r = requests.post(url, headers=headers, json=payload, timeout=180)
-                  if r.status_code != 200:
-                      print(f"[OpenAI] HTTP {r.status_code}: {r.text[:500]}")
-                      if i < max_retries:
-                          print(f"[OpenAI] Aguardando {delay}s e tentando de novo…")
-                          time.sleep(delay)
-                          continue
-                      raise SystemExit("Falha ao gerar imagem.")
+                  try:
+                      print(f"[OpenAI] Tentativa {i}/{max_retries}…")
+                      r = s.post(URL, headers=HEADERS, json=PAYLOAD, timeout=HTTP_TIMEOUT)
 
-                  data = r.json()
-                  if not data.get("data"):
-                      print("[OpenAI] Resposta inesperada:", json.dumps(data)[:500])
-                      if i < max_retries:
-                          time.sleep(delay)
-                          continue
-                      raise SystemExit("Sem dados de imagem na resposta.")
+                      # HTTP não-200
+                      if r.status_code != 200:
+                          txt = r.text[:800]
+                          print(f"[OpenAI] HTTP {r.status_code}: {txt}")
+                          last_err_txt = txt
+                          # Caso clássico de org não verificada (403)
+                          if r.status_code == 403 and "must be verified" in txt.lower():
+                              raise SystemExit(
+                                  "403: Organização não verificada para usar gpt-image-1. "
+                                  "Verifique sua org no painel e tente de novo."
+                              )
+                          if i < max_retries:
+                              print(f"[OpenAI] Aguardando {delay}s e tentando de novo…")
+                              time.sleep(delay)
+                              continue
+                          raise SystemExit("Falha ao gerar imagem.")
 
-                  item = data["data"][0]
-                  if "b64_json" in item:
-                      b64 = item["b64_json"]
-                      with open(OUT_NAME, "wb") as f:
-                          f.write(base64.b64decode(b64))
-                      print(f"[OK] Imagem salva em {OUT_NAME} (via b64).")
-                      return OUT_NAME
-                  elif "url" in item:
-                      img_url = item["url"]
-                      img = requests.get(img_url, timeout=180)
-                      img.raise_for_status()
-                      with open(OUT_NAME, "wb") as f:
-                          f.write(img.content)
-                      print(f"[OK] Imagem salva em {OUT_NAME} (via url).")
-                      return OUT_NAME
-                  else:
-                      print("[OpenAI] Item sem b64_json nem url:", item)
+                      data = r.json()
+                      if not data.get("data"):
+                          print("[OpenAI] Resposta inesperada:", json.dumps(data)[:800])
+                          if i < max_retries:
+                              time.sleep(delay)
+                              continue
+                          raise SystemExit("Sem dados de imagem na resposta.")
+
+                      item = data["data"][0]
+                      if "b64_json" in item:
+                          b64 = item["b64_json"]
+                          with open(OUT_NAME, "wb") as f:
+                              f.write(base64.b64decode(b64))
+                          print(f"[OK] Imagem salva em {OUT_NAME} (via b64).")
+                          return OUT_NAME
+                      elif "url" in item:
+                          img_url = item["url"]
+                          # download via mesma sessão com retry
+                          img = s.get(img_url, timeout=HTTP_TIMEOUT)
+                          img.raise_for_status()
+                          with open(OUT_NAME, "wb") as f:
+                              f.write(img.content)
+                          print(f"[OK] Imagem salva em {OUT_NAME} (via url).")
+                          return OUT_NAME
+                      else:
+                          print("[OpenAI] Item sem b64_json nem url:", item)
+                          if i < max_retries:
+                              time.sleep(delay)
+                              continue
+                          raise SystemExit("Formato de resposta não suportado.")
+
+                  except requests.exceptions.ReadTimeout:
+                      print("[OpenAI] ReadTimeout.")
+                      if i < max_retries:
+                          sleep_s = delay
+                          print(f"[OpenAI] Backoff {sleep_s}s…")
+                          time.sleep(sleep_s)
+                          continue
+                      raise SystemExit("Timeout de leitura após múltiplas tentativas.")
+                  except requests.exceptions.ConnectTimeout:
+                      print("[OpenAI] ConnectTimeout.")
+                      if i < max_retries:
+                          sleep_s = delay
+                          print(f"[OpenAI] Backoff {sleep_s}s…")
+                          time.sleep(sleep_s)
+                          continue
+                      raise SystemExit("Timeout de conexão após múltiplas tentativas.")
+                  except requests.exceptions.RetryError as e:
+                      print("[OpenAI] Excedeu tentativas do Retry:", str(e))
                       if i < max_retries:
                           time.sleep(delay)
                           continue
-                      raise SystemExit("Formato de resposta não suportado.")
+                      raise SystemExit("Falhou após múltiplas tentativas (RetryError).")
+                  except requests.exceptions.RequestException as e:
+                      # pega qualquer outro erro de requests
+                      print("[OpenAI] Erro de rede:", repr(e))
+                      if i < max_retries:
+                          time.sleep(delay)
+                          continue
+                      raise SystemExit("Falhou após múltiplas tentativas (RequestException).")
+
+              # se saiu do loop sem return
+              if last_err_txt:
+                  print("[OpenAI] Último erro:", last_err_txt)
               raise SystemExit("Falha após múltiplas tentativas.")
 
-          # Geração
+          # ---- Geração ----
           img_path = try_generate()
 
-          # Monta e-mail
+          # ---- Monta e-mail ----
           msg = EmailMessage()
           msg["Subject"] = "Imagem do dia"
-          msg["From"] = SMTP_USER  # Para Gmail, o From deve ser o mesmo da conta autenticada
+          msg["From"] = SMTP_USER
           msg["To"] = SMTP_TO
           tz = timezone(timedelta(hours=-3))  # America/Sao_Paulo
           msg.set_content(
@@ -130,10 +203,10 @@ jobs:
           with open(img_path, "rb") as f:
               msg.add_attachment(f.read(), maintype=maintype, subtype=subtype, filename=img_path)
 
-          # Envio por SMTP (com debug e erros explícitos)
+          # ---- Envio por SMTP (com debug e erros explícitos) ----
           try:
               s = smtplib.SMTP(SMTP_HOST, SMTP_PORT, timeout=60)
-              s.set_debuglevel(1)  # <-- log do diálogo SMTP
+              s.set_debuglevel(1)  # log do diálogo SMTP
               s.ehlo()
               if SMTP_PORT == 587:
                   s.starttls()
@@ -162,7 +235,6 @@ jobs:
               sys.exit(1)
 
           if refused:
-              # send_message retorna dict de recusados; vazio = tudo OK
               print(f"Aviso: servidor recusou alguns destinatários: {refused}", file=sys.stderr)
               sys.exit(1)
 
