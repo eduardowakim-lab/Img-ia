@@ -14,7 +14,7 @@ jobs:
         run: |
           python -m pip install --upgrade pip requests feedparser
 
-      - name: Gerar imagem e enviar e-mail (legenda IG)
+      - name: Gerar imagem e enviar e-mail (legenda IG + anexos)
         timeout-minutes: 15
         run: |
           cat > script.py <<'EOF'
@@ -54,6 +54,10 @@ jobs:
               print("Faltando variáveis: " + ", ".join(missing), file=sys.stderr)
               sys.exit(1)
 
+          if "@" not in SMTP_TO:
+              print(f"SMTP_TO inválido: '{SMTP_TO}'", file=sys.stderr)
+              sys.exit(1)
+
           # ---- Sessão HTTP robusta ----
           def session_with_retries():
               retry = Retry(
@@ -85,11 +89,12 @@ jobs:
               if not feed.entries:
                   raise SystemExit("Não foi possível obter notícias.")
               e = feed.entries[0]
-              return {
-                  "title": e.get("title","").strip(),
-                  "summary": (e.get("summary") or e.get("description") or "").strip(),
-                  "link": e.get("link","").strip()
-              }
+              title = (e.get("title") or "").strip()
+              summary = (e.get("summary") or e.get("description") or "").strip().replace("\n"," ")
+              link = (e.get("link") or "").strip()
+              print(f"[news] Título: {title}")
+              print(f"[news] Link: {link}")
+              return {"title": title, "summary": summary, "link": link}
 
           # ---- Geração de imagem ----
           def generate_image():
@@ -97,8 +102,11 @@ jobs:
               url = "https://api.openai.com/v1/images/generations"
               headers = {"Authorization": f"Bearer {OPENAI_API_KEY}","Content-Type": "application/json"}
               payload = {"model":"gpt-image-1","prompt":PROMPT,"size":SIZE,"n":N_IMAGES}
+              print(f"[img] Gerando imagem com size={SIZE} n={N_IMAGES}")
               r = s.post(url, headers=headers, json=payload, timeout=HTTP_TIMEOUT)
-              r.raise_for_status()
+              if r.status_code != 200:
+                  print("[img] Erro:", r.text, file=sys.stderr)
+                  r.raise_for_status()
               data = r.json()
               item = data["data"][0]
               if "b64_json" in item:
@@ -108,7 +116,7 @@ jobs:
                   with open(OUT_NAME,"wb") as f: f.write(img.content)
               else:
                   raise SystemExit("Formato de resposta inesperado.")
-              print(f"[OK] Imagem salva em {OUT_NAME}")
+              print(f"[img] OK -> {OUT_NAME}")
               return OUT_NAME
 
           # ---- Geração de legenda ----
@@ -129,11 +137,17 @@ jobs:
                   ],
                   "temperature":0.8,"max_tokens":160
               }
+              print("[caption] Gerando legenda…")
               r = s.post(url, headers=headers, json=payload, timeout=HTTP_TIMEOUT)
               if r.status_code!=200:
-                  print("[caption] Falha:",r.text); return "Resumo do dia pronto para o feed. #noticias #hoje #brasil"
+                  print("[caption] Falha:", r.text, file=sys.stderr)
+                  return "Resumo do dia pronto para o feed. #noticias #hoje #brasil"
               data = r.json()
-              return data["choices"][0]["message"]["content"].strip().replace("\n"," ")
+              content = data["choices"][0]["message"]["content"].strip().replace("\n"," ")
+              if not content:
+                  content = "Resumo do dia pronto para o feed. #noticias #hoje #brasil"
+              print(f"[caption] {content}")
+              return content
 
           # ---- Execução ----
           news = fetch_top_news()
@@ -148,22 +162,33 @@ jobs:
           msg["From"] = SMTP_USER
           msg["To"] = SMTP_TO
 
+          # Corpo: legenda + link da notícia
           body = (
-              "Legenda sugerida para Instagram:\n\n"
+              "Legenda sugerida para Instagram (copie e cole):\n\n"
               f"{caption}\n\n"
-              f"(Fonte: {news['link']})\n"
+              f"Fonte: {news['link']}\n"
           )
-          msg.set_content(body)
+          print("[mail] Tamanho do corpo (chars):", len(body))
+          msg.set_content(body)  # define o corpo ANTES dos anexos
 
-          # anexa imagem
+          # Anexar a imagem
           ctype,_ = mimetypes.guess_type(img_path)
           if not ctype: ctype="image/png"
           maintype,subtype = ctype.split("/",1)
           with open(img_path,"rb") as f:
-              msg.add_attachment(f.read(), maintype=maintype, subtype=subtype, filename=img_path)
+              img_bytes = f.read()
+              print("[mail] Anexando imagem, bytes:", len(img_bytes))
+              msg.add_attachment(img_bytes, maintype=maintype, subtype=subtype, filename=os.path.basename(img_path))
 
-          # anexa legenda em txt
-          msg.add_attachment(caption.encode("utf-8"), maintype="text", subtype="plain", filename="caption.txt")
+          # Anexar caption.txt
+          cap_bytes = caption.encode("utf-8")
+          print("[mail] Anexando caption.txt, bytes:", len(cap_bytes))
+          msg.add_attachment(cap_bytes, maintype="text", subtype="plain", filename="caption.txt")
+
+          # Anexar news.txt (título + link)
+          news_txt = f"{news['title']}\n{news['link']}\n".encode("utf-8")
+          print("[mail] Anexando news.txt, bytes:", len(news_txt))
+          msg.add_attachment(news_txt, maintype="text", subtype="plain", filename="news.txt")
 
           # Envio SMTP
           try:
@@ -173,12 +198,15 @@ jobs:
               if SMTP_PORT==587:
                   s.starttls(); s.ehlo()
               s.login(SMTP_USER, SMTP_PASS)
-              s.send_message(msg)
+              refused = s.send_message(msg)
               s.quit()
           except Exception:
               print("Erro SMTP:\n"+traceback.format_exc(), file=sys.stderr); sys.exit(1)
 
-          print("E-mail enviado com sucesso! (imagem + legenda)")
+          if refused:
+              print(f"Aviso: servidor recusou alguns destinatários: {refused}", file=sys.stderr); sys.exit(1)
+
+          print("E-mail enviado com sucesso! (imagem + legenda + news.txt)")
           EOF
 
           python script.py
@@ -187,7 +215,7 @@ jobs:
           SMTP_USER:  ${{ secrets.SMTP_USER }}
           SMTP_PASS:  ${{ secrets.SMTP_PASS }}
           SMTP_TO:    ${{ vars.SMTP_TO }}
-          PROMPT:     ${{ vars.PROMPT }}       # imagem baseada nesse prompt
+          PROMPT:     ${{ vars.PROMPT }}
           IMG_SIZE:   ${{ vars.IMG_SIZE }}     # ex: 1024x1024
           N_IMAGES:   ${{ vars.N_IMAGES }}
           SMTP_HOST:  ${{ vars.SMTP_HOST }}
