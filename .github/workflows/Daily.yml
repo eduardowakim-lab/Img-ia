@@ -1,26 +1,188 @@
-import re
-from html import unescape
+name: Imagem do Dia
 
-def _clean_html(s: str) -> str:
-    if not s: return ""
-    s = unescape(s)
-    s = re.sub(r"<br\s*/?>", "\n", s, flags=re.I)
-    s = re.sub(r"<.*?>", "", s)
-    return re.sub(r"\s+\n", "\n", s).strip()
+on:
+  schedule:
+    - cron: "0 11 * * *"   # 08:00 America/Sao_Paulo (GitHub Actions roda em UTC)
+  workflow_dispatch: {}
 
-def fetch_top_news():
-    url = (f"https://news.google.com/rss/search?q={quote_plus(NEWS_QUERY)}&hl=pt-BR&gl=BR&ceid=BR:pt-419"
-           if NEWS_QUERY else
-           "https://news.google.com/rss?hl=pt-BR&gl=BR&ceid=BR:pt-419")
-    print(f"[news] Feed: {url}")
-    r = requests.get(url, timeout=(10,30)); r.raise_for_status()
-    feed = feedparser.parse(r.content)
-    if not feed.entries:
-        raise SystemExit("Não foi possível obter notícias.")
+jobs:
+  run-daily:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Instalar dependências
+        run: |
+          python -m pip install --upgrade pip requests feedparser
 
-    e = feed.entries[0]
-    title   = _clean_html((e.get("title") or "").strip())
-    summary = _clean_html((e.get("summary") or e.get("description") or getattr(e, "summary_detail", {}).get("value", "") or "").strip())
-    link    = (e.get("link") or "").strip()
+      - name: Gerar imagem e enviar e-mail (legenda IG + resumo da notícia)
+        timeout-minutes: 15
+        env:
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          SMTP_USER:  ${{ secrets.SMTP_USER }}
+          SMTP_PASS:  ${{ secrets.SMTP_PASS }}
+          SMTP_TO:    ${{ vars.SMTP_TO }}
+          PROMPT:     ${{ vars.PROMPT }}
+          IMG_SIZE:   ${{ vars.IMG_SIZE }}
+          N_IMAGES:   ${{ vars.N_IMAGES }}
+          SMTP_HOST:  ${{ vars.SMTP_HOST }}
+          SMTP_PORT:  ${{ vars.SMTP_PORT }}
+          NEWS_QUERY: ${{ vars.NEWS_QUERY }}
+        run: |
+          cat > script.py <<'EOF'
+          import os, time, json, base64, requests, smtplib, mimetypes, sys, traceback, feedparser, re
+          from email.message import EmailMessage
+          from datetime import datetime, timezone, timedelta
+          from urllib.parse import quote_plus
+          from html import unescape
 
-    return {"title": title, "summary": summary, "link": link}
+          # ---------- Config ----------
+          OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+          PROMPT   = os.getenv("PROMPT") or "Um nascer do sol nas montanhas do Brasil, estilo realista"
+          SIZE     = os.getenv("IMG_SIZE") or "1024x1024"
+          NEWS_QUERY = (os.getenv("NEWS_QUERY") or "").strip()
+
+          SMTP_USER = os.getenv("SMTP_USER")
+          SMTP_PASS = os.getenv("SMTP_PASS")
+          SMTP_TO   = (os.getenv("SMTP_TO") or "").strip()
+          SMTP_HOST = os.getenv("SMTP_HOST") or "smtp.gmail.com"
+          SMTP_PORT = int(os.getenv("SMTP_PORT") or 587)
+
+          try:
+              N_IMAGES = int(os.getenv("N_IMAGES") or 1)
+          except ValueError:
+              N_IMAGES = 1
+
+          OUT_NAME = "daily.png"
+
+          # ---------- Helpers ----------
+          def _clean_html(s: str) -> str:
+              if not s: return ""
+              s = unescape(s)
+              s = re.sub(r"<br\s*/?>", "\n", s, flags=re.I)
+              s = re.sub(r"<.*?>", "", s)
+              return re.sub(r"\s+\n", "\n", s).strip()
+
+          # ---------- Buscar notícia ----------
+          def fetch_top_news():
+              url = (f"https://news.google.com/rss/search?q={quote_plus(NEWS_QUERY)}&hl=pt-BR&gl=BR&ceid=BR:pt-419"
+                     if NEWS_QUERY else
+                     "https://news.google.com/rss?hl=pt-BR&gl=BR&ceid=BR:pt-419")
+              print(f"[news] Feed: {url}")
+              r = requests.get(url, timeout=(10,30)); r.raise_for_status()
+              feed = feedparser.parse(r.content)
+              if not feed.entries:
+                  raise SystemExit("Não foi possível obter notícias.")
+              e = feed.entries[0]
+              title   = _clean_html((e.get("title") or "").strip())
+              summary = _clean_html((e.get("summary") or e.get("description") or getattr(e, "summary_detail", {}).get("value", "") or "").strip())
+              link    = (e.get("link") or "").strip()
+              return {"title": title, "summary": summary, "link": link}
+
+          # ---------- Imagem ----------
+          def generate_image():
+              url = "https://api.openai.com/v1/images/generations"
+              headers = {"Authorization": f"Bearer {OPENAI_API_KEY}", "Content-Type": "application/json"}
+              payload = {"model":"gpt-image-1","prompt":PROMPT,"size":SIZE,"n":N_IMAGES}
+              r = requests.post(url, headers=headers, json=payload, timeout=(15,360))
+              if r.status_code != 200:
+                  print("[img] Erro:", r.text, file=sys.stderr); r.raise_for_status()
+              data = r.json()
+              item = data["data"][0]
+              if "b64_json" in item:
+                  with open(OUT_NAME,"wb") as f: f.write(base64.b64decode(item["b64_json"]))
+              elif "url" in item:
+                  ir = requests.get(item["url"], timeout=(15,360)); ir.raise_for_status()
+                  with open(OUT_NAME,"wb") as f: f.write(ir.content)
+              else:
+                  raise SystemExit("Formato de resposta inesperado.")
+              print(f"[img] OK -> {OUT_NAME}")
+              return OUT_NAME
+
+          # ---------- Legenda ----------
+          def generate_caption(news):
+              url = "https://api.openai.com/v1/chat/completions"
+              headers = {"Authorization": f"Bearer {OPENAI_API_KEY}", "Content-Type": "application/json"}
+              sys_prompt = ("Você é um redator social em PT-BR. Escreva UMA legenda curta sobre a notícia fornecida, "
+                            "até 240 caracteres, 1–2 frases, sem hashtags no meio. Adicione 3–5 hashtags no final.")
+              user_prompt = f"Título: {news['title']}\nResumo: {news['summary']}"
+              payload = {
+                  "model":"gpt-4o-mini",
+                  "messages":[
+                      {"role":"system","content":sys_prompt},
+                      {"role":"user","content":user_prompt}
+                  ],
+                  "temperature":0.8,"max_tokens":160
+              }
+              try:
+                  r = requests.post(url, headers=headers, json=payload, timeout=(15,360))
+                  r.raise_for_status()
+                  data = r.json()
+                  content = (data["choices"][0]["message"]["content"] or "").strip().replace("\n"," ")
+                  if content:
+                      return content
+              except Exception as ex:
+                  print("[caption] Falha:", repr(ex), file=sys.stderr)
+
+              base = news['title'] or "Resumo do dia"
+              return f"{base}. #noticias #hoje #brasil"
+
+          # ---------- Execução ----------
+          news = fetch_top_news()
+          img_path = generate_image()
+          caption = generate_caption(news)
+
+          print("[debug] Título:", news['title'])
+          print("[debug] Link:", news['link'])
+          print("[debug] Legenda:", caption)
+
+          # ---------- E-mail ----------
+          msg = EmailMessage()
+          tz = timezone(timedelta(hours=-3))
+          now_str = datetime.now(tz).strftime("%d/%m/%Y %H:%M")
+
+          # Assunto inclui o título
+          assunto_titulo = (news['title'][:120] + "…") if len(news['title']) > 120 else news['title']
+          msg["Subject"] = f"Imagem do dia — {assunto_titulo} ({now_str})"
+          msg["From"] = SMTP_USER
+          msg["To"] = SMTP_TO
+
+          body = (
+              "🗞️ RESUMO DA NOTÍCIA\n"
+              f"{news['title']}\n"
+              f"{news['summary']}\n"
+              f"{('Link: ' + news['link'] + '\n') if news['link'] else ''}"
+              "—\n\n"
+              "📸 LEGENDA PARA INSTAGRAM:\n"
+              f"{caption}\n"
+          )
+
+          # Força UTF-8 no corpo
+          msg.set_content(body, subtype="plain", charset="utf-8")
+
+          # anexo imagem
+          ctype,_ = mimetypes.guess_type(img_path)
+          if not ctype: ctype="image/png"
+          maintype,subtype = ctype.split("/",1)
+          with open(img_path,"rb") as f:
+              msg.add_attachment(f.read(), maintype=maintype, subtype=subtype, filename="daily.png")
+
+          # anexo legenda .txt
+          msg.add_attachment(caption.encode("utf-8"), maintype="text", subtype="plain", filename="caption.txt")
+
+          # envio SMTP
+          try:
+              s = smtplib.SMTP(SMTP_HOST, SMTP_PORT, timeout=60)
+              s.set_debuglevel(1)
+              s.ehlo()
+              if SMTP_PORT==587:
+                  s.starttls(); s.ehlo()
+              s.login(SMTP_USER, SMTP_PASS)
+              s.send_message(msg)
+              s.quit()
+          except Exception:
+              print("Erro SMTP:\n"+traceback.format_exc(), file=sys.stderr); sys.exit(1)
+
+          print("E-mail enviado com sucesso! (imagem + resumo + legenda)")
+          EOF
+
+          python script.py
