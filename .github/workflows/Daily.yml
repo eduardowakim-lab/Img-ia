@@ -21,15 +21,15 @@ jobs:
           SMTP_USER:  ${{ secrets.SMTP_USER }}
           SMTP_PASS:  ${{ secrets.SMTP_PASS }}
           SMTP_TO:    ${{ vars.SMTP_TO }}
-          PROMPT:     ${{ vars.PROMPT }}
-          IMG_SIZE:   ${{ vars.IMG_SIZE }}
-          N_IMAGES:   ${{ vars.N_IMAGES }}
-          SMTP_HOST:  ${{ vars.SMTP_HOST }}
-          SMTP_PORT:  ${{ vars.SMTP_PORT }}
-          NEWS_QUERY: ${{ vars.NEWS_QUERY }}
+          PROMPT:     ${{ vars.PROMPT }}      # pode usar placeholders {title} {summary} {person}; ou deixar vazio p/ automático
+          IMG_SIZE:   ${{ vars.IMG_SIZE }}    # ex: 1024x1024
+          N_IMAGES:   ${{ vars.N_IMAGES }}    # ex: 1
+          SMTP_HOST:  ${{ vars.SMTP_HOST }}   # ex: smtp.gmail.com
+          SMTP_PORT:  ${{ vars.SMTP_PORT }}   # ex: 587
+          NEWS_QUERY: ${{ vars.NEWS_QUERY }}  # ex: celebridade OR famoso OR influencer
         run: |
           cat > script.py <<'EOF'
-          import os, time, json, base64, requests, smtplib, mimetypes, sys, traceback, feedparser, re
+          import os, json, base64, requests, smtplib, mimetypes, sys, traceback, feedparser, re
           from email.message import EmailMessage
           from datetime import datetime, timezone, timedelta
           from urllib.parse import quote_plus
@@ -37,7 +37,7 @@ jobs:
 
           # ---------- Config ----------
           OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
-          PROMPT   = os.getenv("PROMPT") or "Um nascer do sol nas montanhas do Brasil, estilo realista"
+          PROMPT   = os.getenv("PROMPT") or ""  # se vazio, geramos a partir da notícia
           SIZE     = os.getenv("IMG_SIZE") or "1024x1024"
           NEWS_QUERY = (os.getenv("NEWS_QUERY") or "").strip()
 
@@ -72,17 +72,77 @@ jobs:
               feed = feedparser.parse(r.content)
               if not feed.entries:
                   raise SystemExit("Não foi possível obter notícias.")
-              e = feed.entries[0]
-              title   = _clean_html((e.get("title") or "").strip())
-              summary = _clean_html((e.get("summary") or e.get("description") or getattr(e, "summary_detail", {}).get("value", "") or "").strip())
-              link    = (e.get("link") or "").strip()
-              return {"title": title, "summary": summary, "link": link}
+
+              def _pack(e):
+                  title   = _clean_html((e.get("title") or "").strip())
+                  summary = _clean_html((e.get("summary") or e.get("description") or getattr(e, "summary_detail", {}).get("value", "") or "").strip())
+                  link    = (e.get("link") or "").strip()
+                  return {"title": title, "summary": summary, "link": link}
+
+              # Prioriza celebridades/influencers nas 10 primeiras
+              kw = re.compile(r"\b(cantor(?:a)?|ator|atriz|influenciador(?:a)?|influencer|celebridad[ea]|famos[oa]|instagram|tiktok|bbb)\b", re.I)
+              for e in feed.entries[:10]:
+                  cand = _pack(e)
+                  if kw.search((cand["title"] + " " + cand["summary"]).lower()):
+                      return cand
+
+              # fallback: primeira do feed
+              return _pack(feed.entries[0])
+
+          # ---------- Extrair pessoa (bem simples) ----------
+          def extract_person(text: str) -> str:
+              # captura primeira sequência de 2+ nomes Capitalizados (com acentos)
+              pats = re.findall(r"\b([A-ZÁÀÂÃÉÊÍÓÔÕÚÇ][a-záàâãéêíóôõúç]+(?:\s+[A-ZÁÀÂÃÉÊÍÓÔÕÚÇ][a-záàâãéêíóôõúç]+)+)\b", text)
+              return pats[0] if pats else ""
+
+          # ---------- Montar prompt da imagem ----------
+          def build_image_prompt(news: dict, base_prompt: str | None) -> str:
+              """
+              Se base_prompt tiver placeholders, preenche com a notícia.
+              Senão, pede ao modelo um prompt curto coerente com a notícia.
+              """
+              person = extract_person(f"{news['title']} {news['summary']}")
+              if base_prompt and any(p in base_prompt for p in ("{title}", "{summary}", "{person}")):
+                  return base_prompt.format(title=news["title"], summary=news["summary"], person=person or "uma celebridade")
+
+              # Gera prompt alinhado via chat
+              url = "https://api.openai.com/v1/chat/completions"
+              headers = {"Authorization": f"Bearer {OPENAI_API_KEY}", "Content-Type": "application/json"}
+              sys_prompt = (
+                  "Gere APENAS um prompt curto (até ~280 caracteres) para gpt-image-1. "
+                  "Tema: escultura/boneco LEGO 3D (estilo LEGO original) coerente com a notícia dada; "
+                  "inclua a pessoa/tema central se existir; ação simples; escultura sobre uma mesa de computador; "
+                  "fundo e piso feitos de peças LEGO; sem marcas/nomes de marcas."
+              )
+              user_prompt = f"Título: {news['title']}\nResumo: {news['summary']}"
+              payload = {
+                  "model": "gpt-4o-mini",
+                  "messages": [
+                      {"role":"system","content": sys_prompt},
+                      {"role":"user","content": user_prompt}
+                  ],
+                  "temperature": 0.6,
+                  "max_tokens": 180
+              }
+              try:
+                  r = requests.post(url, headers=headers, json=payload, timeout=(15,360))
+                  r.raise_for_status()
+                  data = r.json()
+                  content = (data["choices"][0]["message"]["content"] or "").strip()
+                  if content:
+                      return content
+              except Exception as ex:
+                  print("[prompt] Falha ao gerar prompt pela notícia:", repr(ex), file=sys.stderr)
+
+              # fallback: usa PROMPT original (se veio) ou um coringa
+              return (base_prompt or
+                      "Escultura LEGO 3D de uma celebridade do momento, em escala 1/18, sobre uma mesa de computador; fundo e piso feitos de peças LEGO; foto realista.")
 
           # ---------- Imagem ----------
-          def generate_image():
+          def generate_image(prompt_text: str):
               url = "https://api.openai.com/v1/images/generations"
               headers = {"Authorization": f"Bearer {OPENAI_API_KEY}", "Content-Type": "application/json"}
-              payload = {"model":"gpt-image-1","prompt":PROMPT,"size":SIZE,"n":N_IMAGES}
+              payload = {"model":"gpt-image-1","prompt":prompt_text,"size":SIZE,"n":N_IMAGES}
               r = requests.post(url, headers=headers, json=payload, timeout=(15,360))
               if r.status_code != 200:
                   print("[img] Erro:", r.text, file=sys.stderr); r.raise_for_status()
@@ -126,63 +186,70 @@ jobs:
               base = news['title'] or "Resumo do dia"
               return f"{base}. #noticias #hoje #brasil"
 
+          # ---------- E-mail ----------
+          def send_email(news, caption, img_path):
+              msg = EmailMessage()
+              tz = timezone(timedelta(hours=-3))  # América/São Paulo sem DST
+              now_str = datetime.now(tz).strftime("%d/%m/%Y %H:%M")
+
+              assunto_titulo = (news['title'][:120] + "…") if len(news['title']) > 120 else news['title']
+              msg["Subject"] = f"Imagem do dia — {assunto_titulo} ({now_str})"
+              msg["From"] = SMTP_USER
+              msg["To"] = SMTP_TO
+
+              body = (
+                  "🗞️ RESUMO DA NOTÍCIA\n"
+                  f"{news['title']}\n"
+                  f"{news['summary']}\n"
+                  f"{('Link: ' + news['link'] + '\n') if news['link'] else ''}"
+                  "—\n\n"
+                  "📸 LEGENDA PARA INSTAGRAM:\n"
+                  f"{caption}\n"
+              )
+              msg.set_content(body, subtype="plain", charset="utf-8")
+
+              ctype,_ = mimetypes.guess_type(img_path)
+              if not ctype: ctype="image/png"
+              maintype,subtype = ctype.split("/",1)
+              with open(img_path,"rb") as f:
+                  msg.add_attachment(f.read(), maintype=maintype, subtype=subtype, filename="daily.png")
+
+              msg.add_attachment(caption.encode("utf-8"), maintype="text", subtype="plain", filename="caption.txt")
+
+              try:
+                  s = smtplib.SMTP(SMTP_HOST, SMTP_PORT, timeout=60)
+                  s.set_debuglevel(1)
+                  s.ehlo()
+                  if SMTP_PORT==587:
+                      s.starttls(); s.ehlo()
+                  s.login(SMTP_USER, SMTP_PASS)
+                  s.send_message(msg)
+                  s.quit()
+              except Exception:
+                  print("Erro SMTP:\n"+traceback.format_exc(), file=sys.stderr); sys.exit(1)
+
+              print("E-mail enviado com sucesso! (imagem + resumo + legenda)")
+
           # ---------- Execução ----------
+          if not OPENAI_API_KEY:
+              print("Faltou OPENAI_API_KEY", file=sys.stderr); sys.exit(1)
+          if not (SMTP_USER and SMTP_PASS and SMTP_TO):
+              print("Faltam variáveis SMTP_USER/SMTP_PASS/SMTP_TO", file=sys.stderr); sys.exit(1)
+
           news = fetch_top_news()
-          img_path = generate_image()
+
+          # Cria prompt alinhado (usa PROMPT como template se tiver {title}/{summary}/{person})
+          prompt_text = build_image_prompt(news, PROMPT)
+
+          img_path = generate_image(prompt_text)
           caption = generate_caption(news)
 
           print("[debug] Título:", news['title'])
           print("[debug] Link:", news['link'])
+          print("[debug] Prompt usado:", prompt_text)
           print("[debug] Legenda:", caption)
 
-          # ---------- E-mail ----------
-          msg = EmailMessage()
-          tz = timezone(timedelta(hours=-3))
-          now_str = datetime.now(tz).strftime("%d/%m/%Y %H:%M")
-
-          # Assunto inclui o título
-          assunto_titulo = (news['title'][:120] + "…") if len(news['title']) > 120 else news['title']
-          msg["Subject"] = f"Imagem do dia — {assunto_titulo} ({now_str})"
-          msg["From"] = SMTP_USER
-          msg["To"] = SMTP_TO
-
-          body = (
-              "🗞️ RESUMO DA NOTÍCIA\n"
-              f"{news['title']}\n"
-              f"{news['summary']}\n"
-              f"{('Link: ' + news['link'] + '\n') if news['link'] else ''}"
-              "—\n\n"
-              "📸 LEGENDA PARA INSTAGRAM:\n"
-              f"{caption}\n"
-          )
-
-          # Força UTF-8 no corpo
-          msg.set_content(body, subtype="plain", charset="utf-8")
-
-          # anexo imagem
-          ctype,_ = mimetypes.guess_type(img_path)
-          if not ctype: ctype="image/png"
-          maintype,subtype = ctype.split("/",1)
-          with open(img_path,"rb") as f:
-              msg.add_attachment(f.read(), maintype=maintype, subtype=subtype, filename="daily.png")
-
-          # anexo legenda .txt
-          msg.add_attachment(caption.encode("utf-8"), maintype="text", subtype="plain", filename="caption.txt")
-
-          # envio SMTP
-          try:
-              s = smtplib.SMTP(SMTP_HOST, SMTP_PORT, timeout=60)
-              s.set_debuglevel(1)
-              s.ehlo()
-              if SMTP_PORT==587:
-                  s.starttls(); s.ehlo()
-              s.login(SMTP_USER, SMTP_PASS)
-              s.send_message(msg)
-              s.quit()
-          except Exception:
-              print("Erro SMTP:\n"+traceback.format_exc(), file=sys.stderr); sys.exit(1)
-
-          print("E-mail enviado com sucesso! (imagem + resumo + legenda)")
+          send_email(news, caption, img_path)
           EOF
 
           python script.py
