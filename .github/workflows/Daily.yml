@@ -12,7 +12,7 @@ jobs:
     steps:
       - name: Instalar dependências
         run: |
-          python -m pip install --upgrade pip requests feedparser
+          python -m pip install --upgrade pip requests feedparser pillow
 
       - name: Gerar imagem e enviar e-mail (legenda IG + resumo da notícia)
         timeout-minutes: 15
@@ -21,7 +21,7 @@ jobs:
           SMTP_USER:  ${{ secrets.SMTP_USER }}
           SMTP_PASS:  ${{ secrets.SMTP_PASS }}
           SMTP_TO:    ${{ vars.SMTP_TO }}
-          PROMPT:     ${{ vars.PROMPT }}      # pode usar placeholders {title} {summary} {person}; ou deixar vazio p/ automático
+          PROMPT:     ${{ vars.PROMPT }}      # pode ter {title} {summary} {person}; se vazio, gera automático
           IMG_SIZE:   ${{ vars.IMG_SIZE }}    # ex: 1024x1024
           N_IMAGES:   ${{ vars.N_IMAGES }}    # ex: 1
           SMTP_HOST:  ${{ vars.SMTP_HOST }}   # ex: smtp.gmail.com
@@ -34,6 +34,7 @@ jobs:
           from datetime import datetime, timezone, timedelta
           from urllib.parse import quote_plus
           from html import unescape
+          from PIL import Image, ImageDraw, ImageFont
 
           # ---------- Config ----------
           OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
@@ -62,6 +63,27 @@ jobs:
               s = re.sub(r"<.*?>", "", s)
               return re.sub(r"\s+\n", "\n", s).strip()
 
+          def _parse_size(sz: str):
+              try:
+                  w,h = sz.lower().split("x")
+                  return int(w), int(h)
+              except Exception:
+                  return 1024,1024
+
+          def _wrap_text(draw, text, font, max_width):
+              # quebra mantendo largura
+              words = text.split()
+              lines, cur = [], ""
+              for w in words:
+                  test = (cur + " " + w).strip()
+                  if draw.textlength(test, font=font) <= max_width:
+                      cur = test
+                  else:
+                      if cur: lines.append(cur)
+                      cur = w
+              if cur: lines.append(cur)
+              return lines
+
           # ---------- Buscar notícia ----------
           def fetch_top_news():
               url = (f"https://news.google.com/rss/search?q={quote_plus(NEWS_QUERY)}&hl=pt-BR&gl=BR&ceid=BR:pt-419"
@@ -89,30 +111,25 @@ jobs:
               # fallback: primeira do feed
               return _pack(feed.entries[0])
 
-          # ---------- Extrair pessoa (bem simples) ----------
+          # ---------- Extrair pessoa (simples) ----------
           def extract_person(text: str) -> str:
-              # captura primeira sequência de 2+ nomes Capitalizados (com acentos)
               pats = re.findall(r"\b([A-ZÁÀÂÃÉÊÍÓÔÕÚÇ][a-záàâãéêíóôõúç]+(?:\s+[A-ZÁÀÂÃÉÊÍÓÔÕÚÇ][a-záàâãéêíóôõúç]+)+)\b", text)
               return pats[0] if pats else ""
 
           # ---------- Montar prompt da imagem ----------
           def build_image_prompt(news: dict, base_prompt: str | None) -> str:
-              """
-              Se base_prompt tiver placeholders, preenche com a notícia.
-              Senão, pede ao modelo um prompt curto coerente com a notícia.
-              """
               person = extract_person(f"{news['title']} {news['summary']}")
               if base_prompt and any(p in base_prompt for p in ("{title}", "{summary}", "{person}")):
                   return base_prompt.format(title=news["title"], summary=news["summary"], person=person or "uma celebridade")
 
-              # Gera prompt alinhado via chat
+              # Gera prompt alinhado via chat (tenta; se falhar, cai no fallback)
               url = "https://api.openai.com/v1/chat/completions"
               headers = {"Authorization": f"Bearer {OPENAI_API_KEY}", "Content-Type": "application/json"}
               sys_prompt = (
                   "Gere APENAS um prompt curto (até ~280 caracteres) para gpt-image-1. "
-                  "Tema: escultura/boneco LEGO 3D (estilo LEGO original) coerente com a notícia dada; "
-                  "inclua a pessoa/tema central se existir; ação simples; escultura sobre uma mesa de computador; "
-                  "fundo e piso feitos de peças LEGO; sem marcas/nomes de marcas."
+                  "Tema: escultura/boneco LEGO 3D (estilo LEGO original) coerente com a notícia; "
+                  "inclua pessoa/tema central se houver; ação simples; escultura sobre uma mesa de computador; "
+                  "fundo e piso feitos de peças LEGO; sem marcas."
               )
               user_prompt = f"Título: {news['title']}\nResumo: {news['summary']}"
               payload = {
@@ -126,7 +143,13 @@ jobs:
               }
               try:
                   r = requests.post(url, headers=headers, json=payload, timeout=(15,360))
-                  r.raise_for_status()
+                  if r.status_code != 200:
+                      try:
+                          err = r.json().get("error", {})
+                          print("[prompt] Erro chat:", err, file=sys.stderr)
+                      except Exception:
+                          pass
+                      r.raise_for_status()
                   data = r.json()
                   content = (data["choices"][0]["message"]["content"] or "").strip()
                   if content:
@@ -134,29 +157,77 @@ jobs:
               except Exception as ex:
                   print("[prompt] Falha ao gerar prompt pela notícia:", repr(ex), file=sys.stderr)
 
-              # fallback: usa PROMPT original (se veio) ou um coringa
-              return (base_prompt or
-                      "Escultura LEGO 3D de uma celebridade do momento, em escala 1/18, sobre uma mesa de computador; fundo e piso feitos de peças LEGO; foto realista.")
+              # fallback local
+              if person:
+                  return f"Escultura LEGO 3D de {person} em escala 1/18, sobre uma mesa de computador; fundo e piso de peças LEGO; cena coerente com a notícia."
+              return "Escultura LEGO 3D de uma celebridade do momento em escala 1/18, sobre uma mesa de computador; fundo e piso de peças LEGO; foto realista."
+
+          # ---------- Placeholder local ----------
+          def make_placeholder_image(news, filename=OUT_NAME):
+              w,h = _parse_size(SIZE)
+              img = Image.new("RGB", (w,h), (245,245,245))
+              draw = ImageDraw.Draw(img)
+              try:
+                  font_title = ImageFont.truetype("DejaVuSans-Bold.ttf", size=int(h*0.045))
+                  font_small = ImageFont.truetype("DejaVuSans.ttf", size=int(h*0.03))
+              except Exception:
+                  font_title = ImageFont.load_default()
+                  font_small = ImageFont.load_default()
+
+              pad = int(h*0.05)
+              maxw = w - pad*2
+
+              # Header
+              header = "Imagem offline (limite da IA atingido)"
+              draw.text((pad, pad), header, font=font_small, fill=(80,80,80))
+
+              # Título
+              y = pad + int(h*0.05)
+              title_lines = _wrap_text(draw, news.get("title","(sem título)"), font_title, maxw)
+              for line in title_lines[:8]:
+                  draw.text((pad, y), line, font=font_title, fill=(20,20,20))
+                  y += int(font_title.size * 1.25)
+
+              # Rodapé
+              y = min(y + int(h*0.02), h - int(h*0.12))
+              footer = "Veja o e-mail para resumo e link"
+              draw.text((pad, y), footer, font=font_small, fill=(90,90,90))
+
+              img.save(filename, format="PNG")
+              print(f"[img] Placeholder gerado -> {filename}")
+              return filename
 
           # ---------- Imagem ----------
-          def generate_image(prompt_text: str):
+          def generate_image(prompt_text: str, news: dict):
               url = "https://api.openai.com/v1/images/generations"
               headers = {"Authorization": f"Bearer {OPENAI_API_KEY}", "Content-Type": "application/json"}
               payload = {"model":"gpt-image-1","prompt":prompt_text,"size":SIZE,"n":N_IMAGES}
-              r = requests.post(url, headers=headers, json=payload, timeout=(15,360))
-              if r.status_code != 200:
-                  print("[img] Erro:", r.text, file=sys.stderr); r.raise_for_status()
-              data = r.json()
-              item = data["data"][0]
-              if "b64_json" in item:
-                  with open(OUT_NAME,"wb") as f: f.write(base64.b64decode(item["b64_json"]))
-              elif "url" in item:
-                  ir = requests.get(item["url"], timeout=(15,360)); ir.raise_for_status()
-                  with open(OUT_NAME,"wb") as f: f.write(ir.content)
-              else:
-                  raise SystemExit("Formato de resposta inesperado.")
-              print(f"[img] OK -> {OUT_NAME}")
-              return OUT_NAME
+              try:
+                  r = requests.post(url, headers=headers, json=payload, timeout=(15,360))
+                  if r.status_code != 200:
+                      # tenta ler o erro e cai no placeholder
+                      try:
+                          err = r.json().get("error", {})
+                          print("[img] Erro:", err, file=sys.stderr)
+                          if err.get("code") == "billing_hard_limit_reached":
+                              return make_placeholder_image(news)
+                      except Exception:
+                          pass
+                      r.raise_for_status()
+                  data = r.json()
+                  item = data["data"][0]
+                  if "b64_json" in item:
+                      with open(OUT_NAME,"wb") as f: f.write(base64.b64decode(item["b64_json"]))
+                  elif "url" in item:
+                      ir = requests.get(item["url"], timeout=(15,360)); ir.raise_for_status()
+                      with open(OUT_NAME,"wb") as f: f.write(ir.content)
+                  else:
+                      raise SystemExit("Formato de resposta inesperado.")
+                  print(f"[img] OK -> {OUT_NAME}")
+                  return OUT_NAME
+              except Exception as ex:
+                  print("[img] Falha geral, gerando placeholder:", repr(ex), file=sys.stderr)
+                  return make_placeholder_image(news)
 
           # ---------- Legenda ----------
           def generate_caption(news):
@@ -175,21 +246,31 @@ jobs:
               }
               try:
                   r = requests.post(url, headers=headers, json=payload, timeout=(15,360))
-                  r.raise_for_status()
+                  if r.status_code != 200:
+                      try:
+                          err = r.json().get("error", {})
+                          print("[caption] Erro chat:", err, file=sys.stderr)
+                          if err.get("code") == "billing_hard_limit_reached":
+                              raise RuntimeError("billing_hard_limit_reached")
+                      except Exception:
+                          pass
+                      r.raise_for_status()
                   data = r.json()
                   content = (data["choices"][0]["message"]["content"] or "").strip().replace("\n"," ")
                   if content:
                       return content
               except Exception as ex:
-                  print("[caption] Falha:", repr(ex), file=sys.stderr)
+                  print("[caption] Fallback offline por erro:", repr(ex), file=sys.stderr)
 
-              base = news['title'] or "Resumo do dia"
-              return f"{base}. #noticias #hoje #brasil"
+              # Fallback offline
+              summ = (news['summary'] or "")[:140].strip()
+              if summ and not summ.endswith("."): summ += "."
+              return f"{news['title']}. {summ} #noticias #hoje #brasil"
 
           # ---------- E-mail ----------
           def send_email(news, caption, img_path):
               msg = EmailMessage()
-              tz = timezone(timedelta(hours=-3))  # América/São Paulo sem DST
+              tz = timezone(timedelta(hours=-3))  # América/São Paulo
               now_str = datetime.now(tz).strftime("%d/%m/%Y %H:%M")
 
               assunto_titulo = (news['title'][:120] + "…") if len(news['title']) > 120 else news['title']
@@ -231,17 +312,12 @@ jobs:
               print("E-mail enviado com sucesso! (imagem + resumo + legenda)")
 
           # ---------- Execução ----------
-          if not OPENAI_API_KEY:
-              print("Faltou OPENAI_API_KEY", file=sys.stderr); sys.exit(1)
           if not (SMTP_USER and SMTP_PASS and SMTP_TO):
               print("Faltam variáveis SMTP_USER/SMTP_PASS/SMTP_TO", file=sys.stderr); sys.exit(1)
 
           news = fetch_top_news()
-
-          # Cria prompt alinhado (usa PROMPT como template se tiver {title}/{summary}/{person})
           prompt_text = build_image_prompt(news, PROMPT)
-
-          img_path = generate_image(prompt_text)
+          img_path = generate_image(prompt_text, news)
           caption = generate_caption(news)
 
           print("[debug] Título:", news['title'])
